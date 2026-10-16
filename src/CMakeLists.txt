@@ -36,7 +36,11 @@ function(libvirtualhid_add_library target_name)
       "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/core/profiles.cpp"
       "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/core/report.cpp"
       "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/core/runtime.cpp"
-      "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/core/types.cpp")
+      "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/core/types.cpp"
+      "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/esp32/bridge_client.cpp"
+      "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/esp32/esp32_backend.cpp"
+      "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/esp32/keyboard_mouse_reports.cpp"
+      "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/esp32/serial_port.cpp")
 
     if(LIBVIRTUALHID_USES_THREADS)
         find_package(Threads REQUIRED)
@@ -92,6 +96,7 @@ function(libvirtualhid_add_library target_name)
         target_link_libraries(${target_name}
           PRIVATE
           advapi32
+          cfgmgr32
           setupapi)
     elseif(APPLE)
         target_sources(${target_name}

@@ -104,7 +104,8 @@ namespace lvh {
    */
   enum class BackendKind {
     fake,  ///< In-memory backend for tests and API validation.
-    platform_default,  ///< Native backend for the current platform.
+    platform_default,  ///< Native backend for the current platform, or an attached ESP32-S3 bridge (see esp32_bridge).
+    esp32_bridge,  ///< ESP32-S3 USB bridge; devices enumerate as real USB devices without a host driver. `platform_default` also selects it when a bridge is attached, `LVH_ESP32_PORT` is set, or `LVH_BACKEND=esp32_bridge`; `LVH_BACKEND=platform` opts out.
   };
 
   /**
@@ -138,6 +139,15 @@ namespace lvh {
      * @brief Optional callback for diagnostic messages.
      */
     LogCallback log_callback;
+
+    /**
+     * @brief Serial port of the ESP32-S3 bridge for BackendKind::esp32_bridge.
+     *
+     * Use a path such as `COM5` or `/dev/ttyACM0`. When empty, the backend
+     * auto-detects the port by its `LVHB-` USB serial number on Linux and
+     * Windows.
+     */
+    std::string esp32_bridge_port;
   };
 
   /**

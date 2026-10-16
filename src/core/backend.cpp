@@ -4,12 +4,15 @@
  */
 
 // standard includes
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
 // local includes
 #include "core/backend.hpp"
+#include "platform/esp32/esp32_backend.hpp"
 
 namespace lvh::detail {
   namespace {
@@ -187,9 +190,47 @@ namespace lvh::detail {
 
   }  // namespace
 
-  std::unique_ptr<Backend> create_backend(BackendKind kind) {
-    if (kind == BackendKind::fake) {
+  namespace {
+
+    std::string read_environment(const char *name) {
+#if defined(_WIN32)
+      char *value = nullptr;
+      std::size_t size = 0;
+      if (_dupenv_s(&value, &size, name) != 0 || value == nullptr) {
+        return {};
+      }
+      std::string result {value};
+      std::free(value);
+      return result;
+#else
+      const char *value = std::getenv(name);
+      return value != nullptr ? std::string {value} : std::string {};
+#endif
+    }
+
+  }  // namespace
+
+  std::unique_ptr<Backend> create_backend(const RuntimeOptions &options) {
+    if (options.backend == BackendKind::fake) {
       return std::make_unique<FakeBackend>();
+    }
+    if (options.backend == BackendKind::esp32_bridge) {
+      return esp32::create_esp32_backend(options);
+    }
+    // An attached ESP32-S3 bridge replaces the platform backend, so existing
+    // consumers gain driverless devices without code changes.
+    if (const auto port = esp32::select_bridge_for_platform_default(
+          options,
+          read_environment("LVH_BACKEND"),
+          read_environment("LVH_ESP32_PORT"),
+          []() {
+            return !esp32::find_bridge_ports().empty();
+          }
+        );
+        port.has_value()) {
+      auto bridge_options = options;
+      bridge_options.esp32_bridge_port = *port;
+      return esp32::create_esp32_backend(bridge_options);
     }
 
     return create_platform_backend();
