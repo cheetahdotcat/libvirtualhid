@@ -218,7 +218,7 @@ namespace lvh::detail {
       return esp32::create_esp32_backend(options);
     }
     // An attached ESP32-S3 bridge replaces the platform backend, so existing
-    // consumers gain driverless devices without code changes.
+    // consumers use it without code changes.
     if (const auto port = esp32::select_bridge_for_platform_default(
           options,
           read_environment("LVH_BACKEND"),

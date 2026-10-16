@@ -2,9 +2,9 @@
  * @file src/platform/esp32/esp32_backend.cpp
  * @brief Backend that publishes gamepads through an ESP32-S3 USB bridge.
  *
- * The bridge enumerates as real USB devices on the host it is plugged into,
- * so Windows binds its inbox drivers (xusb22 for XInput, hidclass for HID)
- * and no virtual-device driver is installed. Each gamepad occupies one of
+ * The bridge enumerates as USB devices on the host it is plugged into, and
+ * Windows binds its inbox drivers (xusb22 for XInput, hidclass for HID).
+ * Each gamepad occupies one of
  * the bridge's two slots; any slot change re-enumerates the bridge.
  */
 

@@ -105,7 +105,7 @@ namespace lvh {
   enum class BackendKind {
     fake,  ///< In-memory backend for tests and API validation.
     platform_default,  ///< Native backend for the current platform, or an attached ESP32-S3 bridge (see esp32_bridge).
-    esp32_bridge,  ///< ESP32-S3 USB bridge; devices enumerate as real USB devices without a host driver. `platform_default` also selects it when a bridge is attached, `LVH_ESP32_PORT` is set, or `LVH_BACKEND=esp32_bridge`; `LVH_BACKEND=platform` opts out.
+    esp32_bridge,  ///< ESP32-S3 USB bridge; devices enumerate as USB devices of the bridge. `platform_default` also selects it when a bridge is attached, `LVH_ESP32_PORT` is set, or `LVH_BACKEND=esp32_bridge`; `LVH_BACKEND=platform` opts out.
   };
 
   /**

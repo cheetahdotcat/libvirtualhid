@@ -474,7 +474,7 @@ TEST(Esp32BridgeBackendTest, ReportsBackendUnavailableWithoutBridge) {
   EXPECT_EQ(result.status.code(), lvh::ErrorCode::backend_unavailable);
 }
 
-TEST(Esp32BridgeBackendTest, AdvertisesDriverlessGamepads) {
+TEST(Esp32BridgeBackendTest, AdvertisesBridgeCapabilities) {
   BridgeHarness harness;
   const auto &caps = harness.backend->capabilities();
   EXPECT_EQ(caps.backend_name, "esp32_bridge");
