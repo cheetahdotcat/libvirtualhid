@@ -148,6 +148,14 @@ namespace lvh {
      * Windows.
      */
     std::string esp32_bridge_port;
+
+    /**
+     * @brief Whether BackendKind::platform_default may switch to an attached ESP32-S3 bridge.
+     *
+     * Consumers that let users choose the bridge explicitly set this to
+     * `false` so other choices are never redirected to the bridge.
+     */
+    bool esp32_bridge_autodetect = true;
   };
 
   /**

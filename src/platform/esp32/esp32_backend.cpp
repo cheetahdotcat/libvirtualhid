@@ -19,6 +19,7 @@
 #include "platform/esp32/keyboard_mouse_reports.hpp"
 #include "shared/playstation_feature_reports.hpp"
 #include "shared/switch_pro_protocol.hpp"
+#include <libvirtualhid/esp32_bridge.hpp>
 #include <libvirtualhid/profiles.hpp>
 #include <libvirtualhid/report.hpp>
 
@@ -886,7 +887,7 @@ namespace lvh::detail::esp32 {
     const std::function<bool()> &bridge_present
   ) {
     const auto port = !env_port.empty() ? std::string {env_port} : options.esp32_bridge_port;
-    if (env_backend == "platform") {
+    if (!options.esp32_bridge_autodetect || env_backend == "platform") {
       return std::nullopt;
     }
     if (env_backend == "esp32_bridge" || !port.empty() || (bridge_present && bridge_present())) {
@@ -905,3 +906,7 @@ namespace lvh::detail::esp32 {
   }
 
 }  // namespace lvh::detail::esp32
+
+std::vector<std::string> lvh::find_esp32_bridge_ports() {
+  return detail::esp32::find_bridge_ports();
+}

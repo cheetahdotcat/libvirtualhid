@@ -44,6 +44,7 @@ namespace lvh::detail::esp32 {
    * `LVH_BACKEND=platform` disables the bridge and `LVH_BACKEND=esp32_bridge`
    * forces it. Otherwise a configured port (`LVH_ESP32_PORT` or
    * RuntimeOptions::esp32_bridge_port) or a detected bridge selects it.
+   * RuntimeOptions::esp32_bridge_autodetect `false` disables all of this.
    *
    * @param options Runtime options.
    * @param env_backend Value of `LVH_BACKEND`, empty when unset.

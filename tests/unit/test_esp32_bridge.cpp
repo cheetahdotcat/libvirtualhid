@@ -883,4 +883,6 @@ TEST(Esp32BridgeSelectionTest, PlatformDefaultPicksBridgeFromEnvironmentPortOrDe
   options.esp32_bridge_port = "/dev/ttyACM1";
   EXPECT_EQ(select_bridge_for_platform_default(options, "", "", absent), std::optional<std::string> {"/dev/ttyACM1"});
   EXPECT_EQ(probes, 1);
+  options.esp32_bridge_autodetect = false;
+  EXPECT_FALSE(select_bridge_for_platform_default(options, "esp32_bridge", "COM5", present).has_value());
 }
