@@ -949,3 +949,7 @@ namespace lvh::detail::esp32 {
 std::vector<std::string> lvh::find_esp32_bridge_ports() {
   return detail::esp32::find_bridge_ports();
 }
+
+lvh::Esp32BridgeStatus lvh::esp32_bridge_status() {
+  return detail::esp32::active_bridge_status();
+}

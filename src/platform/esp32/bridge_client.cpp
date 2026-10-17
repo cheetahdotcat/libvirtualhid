@@ -65,6 +65,10 @@ namespace lvh::detail::esp32 {
       return left->kind == right->kind && left->report_descriptor == right->report_descriptor;
     }
 
+    // The client lvh::esp32_bridge_status() reports on; set by start(), cleared by the destructor.
+    std::mutex active_client_mutex;
+    const BridgeClient *active_client = nullptr;
+
     std::uint32_t initial_generation() {
       // Distinct per process so a bridge that kept an older host's layout is never mistaken for ours.
       const auto ticks = static_cast<std::uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count());
@@ -82,6 +86,12 @@ namespace lvh::detail::esp32 {
       next_generation_ {initial_generation()} {}
 
   BridgeClient::~BridgeClient() {
+    {
+      std::lock_guard lock {active_client_mutex};
+      if (active_client == this) {
+        active_client = nullptr;
+      }
+    }
     if (supervisor_.joinable()) {
       supervisor_.request_stop();
       supervisor_.join();
@@ -93,6 +103,10 @@ namespace lvh::detail::esp32 {
   }
 
   OperationStatus BridgeClient::start() {
+    {
+      std::lock_guard lock {active_client_mutex};
+      active_client = this;
+    }
     if (!reader_.joinable()) {
       reader_ = std::jthread {[this](std::stop_token stop_token) {
         reader_loop(std::move(stop_token));
@@ -261,6 +275,24 @@ namespace lvh::detail::esp32 {
   std::string BridgeClient::firmware_version() const {
     std::lock_guard lock {state_mutex_};
     return firmware_version_;
+  }
+
+  Esp32BridgeStatus BridgeClient::status() const {
+    Esp32BridgeStatus status;
+    status.active = true;
+    status.port = port_path();
+    std::lock_guard lock {state_mutex_};
+    status.connected = connected_;
+    status.awaiting_pairing = awaiting_pairing_;
+    status.pairing_required = pairing_required_;
+    status.device_id = device_id_;
+    status.firmware_version = firmware_version_;
+    return status;
+  }
+
+  Esp32BridgeStatus active_bridge_status() {
+    std::lock_guard lock {active_client_mutex};
+    return active_client != nullptr ? active_client->status() : Esp32BridgeStatus {};
   }
 
   std::string BridgeClient::device_id() const {
@@ -476,6 +508,7 @@ namespace lvh::detail::esp32 {
               device_id_.push_back(digits[byte >> 4U]);
               device_id_.push_back(digits[byte & 0x0FU]);
             }
+            pairing_required_ = (payload[flags_offset] & LVHB_AUTH_PAIRING_REQUIRED) != 0U;
             if ((payload[flags_offset] & LVHB_AUTH_AUTHORIZED) != 0U) {
               connected_ = true;
               replay = device_generation_ != 0U && device_generation_ == desired_generation_;

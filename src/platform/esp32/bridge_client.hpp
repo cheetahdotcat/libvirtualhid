@@ -22,6 +22,7 @@
 #include "platform/esp32/credential_store.hpp"
 #include "platform/esp32/esp32_bridge_protocol.h"
 #include "platform/esp32/serial_port.hpp"
+#include <libvirtualhid/esp32_bridge.hpp>
 #include <libvirtualhid/types.hpp>
 
 namespace lvh::detail::esp32 {
@@ -156,6 +157,13 @@ namespace lvh::detail::esp32 {
     std::string firmware_version() const;
 
     /**
+     * @brief Snapshot the connection and pairing state.
+     *
+     * @return Status with `active` set.
+     */
+    Esp32BridgeStatus status() const;
+
+    /**
      * @brief Get the bridge identity reported by the last handshake.
      *
      * @return Upper-case hex device id, or empty before the first handshake.
@@ -226,6 +234,7 @@ namespace lvh::detail::esp32 {
     PendingAck pending_ack_;
     std::chrono::steady_clock::time_point last_frame_time_;
     bool awaiting_pairing_ = false;  ///< Handshake done, waiting for the BOOT press.
+    bool pairing_required_ = false;  ///< Pairing flag from the last HELLO_ACK.
     bool pairing_announced_ = false;  ///< The "press BOOT" hint was logged for this bridge.
     std::optional<std::chrono::steady_clock::time_point> pairing_retry_at_;
     std::array<std::uint8_t, LVHB_NONCE_SIZE> nonce_ {};
@@ -247,5 +256,12 @@ namespace lvh::detail::esp32 {
     std::jthread reader_;
     std::jthread supervisor_;
   };
+
+  /**
+   * @brief Status of the most recently started client, for lvh::esp32_bridge_status().
+   *
+   * @return Status, `active == false` when no client is running.
+   */
+  Esp32BridgeStatus active_bridge_status();
 
 }  // namespace lvh::detail::esp32

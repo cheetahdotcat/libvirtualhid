@@ -766,6 +766,7 @@ TEST(Esp32BridgePairingTest, UnpairedBridgeDefersLayoutUntilBootPress) {
     return harness.device->pairing_pending();
   }));
   EXPECT_EQ(harness.device->commits(), 0);
+  EXPECT_TRUE(lvh::esp32_bridge_status().awaiting_pairing);
 
   harness.device->press_boot();
   ASSERT_TRUE(harness.device->wait_until([&]() {
@@ -774,6 +775,11 @@ TEST(Esp32BridgePairingTest, UnpairedBridgeDefersLayoutUntilBootPress) {
   EXPECT_FALSE(harness.client->awaiting_pairing());
   EXPECT_EQ(harness.credentials->size(), 1U);
   EXPECT_EQ(harness.client->device_id(), "A4CB8F000001");
+  const auto status = lvh::esp32_bridge_status();
+  EXPECT_TRUE(status.active);
+  EXPECT_TRUE(status.pairing_required);
+  EXPECT_FALSE(status.awaiting_pairing);
+  EXPECT_EQ(status.device_id, "A4CB8F000001");
 }
 
 TEST(Esp32BridgePairingTest, StoredPairingAuthenticatesAfterReboot) {
