@@ -19,6 +19,7 @@
 #include <vector>
 
 // local includes
+#include "platform/esp32/credential_store.hpp"
 #include "platform/esp32/esp32_bridge_protocol.h"
 #include "platform/esp32/serial_port.hpp"
 #include <libvirtualhid/types.hpp>
@@ -81,6 +82,11 @@ namespace lvh::detail::esp32 {
    * on every layout change because the bridge re-enumerates. A supervisor
    * thread sends keepalives and restores the desired layout after the bridge
    * resets or drops slots on its own.
+   *
+   * When the bridge requires pairing, every handshake authenticates with the
+   * stored credential. Without one the client asks the bridge to pair and
+   * keeps the request open until the user presses BOOT; layouts requested in
+   * the meantime are applied once pairing completes.
    */
   class BridgeClient {
   public:
@@ -90,8 +96,10 @@ namespace lvh::detail::esp32 {
      * @param opener Opens the bridge port.
      * @param logger Diagnostic sink, may be empty.
      * @param timings Timeouts.
+     * @param credentials Pairing secret storage, may be empty when the bridge does not require pairing.
+     * @param client_name Label the bridge shows for this host's pairing.
      */
-    BridgeClient(SerialPortOpener opener, BridgeLogger logger, BridgeTimings timings = {});
+    BridgeClient(SerialPortOpener opener, BridgeLogger logger, BridgeTimings timings = {}, std::shared_ptr<CredentialStore> credentials = nullptr, std::string client_name = "libvirtualhid");
 
     BridgeClient(const BridgeClient &) = delete;
     BridgeClient &operator=(const BridgeClient &) = delete;
@@ -105,6 +113,8 @@ namespace lvh::detail::esp32 {
 
     /**
      * @brief Start the worker threads and wait for the first handshake.
+     *
+     * Succeeds while the bridge waits for pairing; layouts are then deferred.
      *
      * @return Success, or `backend_unavailable` when no bridge answers.
      */
@@ -146,6 +156,20 @@ namespace lvh::detail::esp32 {
     std::string firmware_version() const;
 
     /**
+     * @brief Get the bridge identity reported by the last handshake.
+     *
+     * @return Upper-case hex device id, or empty before the first handshake.
+     */
+    std::string device_id() const;
+
+    /**
+     * @brief Check whether the client waits for the user to confirm pairing on the bridge.
+     *
+     * @return `true` while a pairing request is open.
+     */
+    bool awaiting_pairing() const;
+
+    /**
      * @brief Get the path of the currently open port.
      *
      * @return Port path, or empty while disconnected.
@@ -179,10 +203,16 @@ namespace lvh::detail::esp32 {
     OperationStatus apply_layout_locked(const BridgeLayout &layout);
     bool wait_for_generation(std::uint32_t generation, std::chrono::milliseconds timeout);
     void replay_inputs();
+    std::uint32_t take_generation();
+    void track_layout_inputs(const BridgeLayout &layout);
+    void authenticate();
+    void request_pairing();
 
     SerialPortOpener opener_;
     BridgeLogger logger_;
     BridgeTimings timings_;
+    std::shared_ptr<CredentialStore> credentials_;
+    std::string client_name_;
 
     mutable std::mutex port_mutex_;
     std::shared_ptr<SerialPort> port_;  ///< Guarded by port_mutex_; the reader reads from a copy.
@@ -195,6 +225,12 @@ namespace lvh::detail::esp32 {
     std::string firmware_version_;
     PendingAck pending_ack_;
     std::chrono::steady_clock::time_point last_frame_time_;
+    bool awaiting_pairing_ = false;  ///< Handshake done, waiting for the BOOT press.
+    bool pairing_announced_ = false;  ///< The "press BOOT" hint was logged for this bridge.
+    std::optional<std::chrono::steady_clock::time_point> pairing_retry_at_;
+    std::array<std::uint8_t, LVHB_NONCE_SIZE> nonce_ {};
+    std::array<std::uint8_t, LVHB_DEVICE_ID_SIZE> device_id_bytes_ {};
+    std::string device_id_;  ///< Upper-case hex of device_id_bytes_.
 
     std::mutex layout_mutex_;
     std::optional<BridgeLayout> desired_layout_;

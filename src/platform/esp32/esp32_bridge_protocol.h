@@ -8,6 +8,14 @@
  * CRC-16/CCITT-FALSE over `type`, `sequence`, and the payload.
  *
  * This header is plain C so the firmware can include it unchanged.
+ *
+ * Pairing: unless the user turned it off, the bridge only accepts layout and
+ * input frames from a host that proved knowledge of a paired secret. HELLO_ACK
+ * carries a fresh nonce; the host answers with #LVHB_MSG_AUTH, where
+ * `mac = HMAC-SHA256(secret, "LVHB-AUTH" || nonce || key_id || device_id)`.
+ * New pairings and every configuration change wait for a press of the
+ * bridge's BOOT button (#LVHB_CONFIRM_WINDOW_MS) and finish with
+ * #LVHB_MSG_CONFIRM_RESULT.
  */
 #pragma once
 
@@ -18,7 +26,7 @@
 extern "C" {
 #endif
 
-#define LVHB_PROTOCOL_VERSION 1U  ///< Bumped on incompatible wire changes.
+#define LVHB_PROTOCOL_VERSION 2U  ///< Bumped on incompatible wire changes.
 #define LVHB_MAX_SLOTS 2U  ///< Device slots that fit next to CDC in the S3 endpoint budget.
 #define LVHB_MAX_PAYLOAD 600U  ///< Largest decoded frame payload.
 #define LVHB_MAX_FRAME (LVHB_MAX_PAYLOAD + 4U)  ///< Largest decoded frame including header and CRC.
@@ -32,12 +40,25 @@ extern "C" {
 #define LVHB_HOST_IDLE_NEUTRAL_MS 3000U  ///< Host silence after which slots fall back to their neutral report.
 #define LVHB_HOST_IDLE_RELEASE_MS 15000U  ///< Host silence after which the bridge drops all slots and re-enumerates.
 #define LVHB_KEEPALIVE_MS 1000U  ///< Interval at which the host sends #LVHB_MSG_PING while slots are active.
+#define LVHB_NONCE_SIZE 16U  ///< Authentication challenge size.
+#define LVHB_DEVICE_ID_SIZE 6U  ///< Bridge identity (its MAC address) carried in HELLO_ACK.
+#define LVHB_KEY_ID_SIZE 8U  ///< Public identifier of one pairing.
+#define LVHB_SECRET_SIZE 32U  ///< Pairing secret size.
+#define LVHB_MAC_SIZE 32U  ///< HMAC-SHA256 size.
+#define LVHB_MAX_PAIRINGS 4U  ///< Pairings the bridge stores.
+#define LVHB_MAX_PAIRING_NAME 32U  ///< Longest host label of a pairing.
+#define LVHB_CONFIRM_WINDOW_MS 30000U  ///< Time the user has to press BOOT after a pairing or configuration request.
+#define LVHB_AUTH_CONTEXT "LVHB-AUTH"  ///< Prefix of the authenticated message.
 
 /**
  * @brief Frame types. Values below 0x80 travel host to device.
  */
 enum lvhb_message_type {
   LVHB_MSG_HELLO = 0x01,  ///< u16 protocol_version.
+  LVHB_MSG_AUTH = 0x06,  ///< u8 key_id[8], u8 mac[32]. Acknowledged with OK or UNAUTHORIZED.
+  LVHB_MSG_PAIR = 0x07,  ///< u8 len, host label. ACK OK arms a BOOT confirmation; the result follows as CONFIRM_RESULT.
+  LVHB_MSG_CONFIG_GET = 0x08,  ///< Empty. Answered with #LVHB_MSG_CONFIG.
+  LVHB_MSG_CONFIG_SET = 0x09,  ///< u8 #lvhb_config_op, arguments. ACK OK arms a BOOT confirmation.
   LVHB_MSG_LAYOUT_BEGIN = 0x02,  ///< u16 vid, u16 pid, u16 bcd_device, u8 len, manufacturer, u8 len, product.
   LVHB_MSG_LAYOUT_SLOT = 0x03,  ///< u8 slot, u8 kind, u8 interval_ms, u16 descriptor_len, descriptor, neutral reports (see #lvhb_slot_kind).
   LVHB_MSG_LAYOUT_FEATURE = 0x04,  ///< u8 slot, u8 report_id, report bytes (including the report id).
@@ -45,12 +66,31 @@ enum lvhb_message_type {
   LVHB_MSG_INPUT_REPORT = 0x10,  ///< u8 slot, report bytes. Not acknowledged.
   LVHB_MSG_PING = 0x11,  ///< u32 token.
 
-  LVHB_MSG_HELLO_ACK = 0x81,  ///< u16 protocol_version, u8 max_slots, u8 usb_mounted, u32 generation, u16 max_descriptor, firmware string.
+  LVHB_MSG_HELLO_ACK = 0x81,  ///< u16 protocol_version, u8 max_slots, u8 usb_mounted, u32 generation, u16 max_descriptor, u8 #lvhb_auth_flags, u8 nonce[16], u8 device_id[6], firmware string.
   LVHB_MSG_ACK = 0x82,  ///< u8 acknowledged_type, u8 acknowledged_sequence, u8 status.
   LVHB_MSG_OUTPUT_REPORT = 0x90,  ///< u8 slot, u8 report_kind, report bytes.
   LVHB_MSG_STATUS = 0x91,  ///< u8 usb_mounted, u8 usb_suspended, u32 generation.
   LVHB_MSG_PONG = 0x92,  ///< u32 token.
   LVHB_MSG_LOG = 0x93,  ///< UTF-8 text.
+  LVHB_MSG_CONFIRM_RESULT = 0x94,  ///< u8 request_type, u8 status; a confirmed PAIR adds u8 key_id[8], u8 secret[32].
+  LVHB_MSG_CONFIG = 0x95,  ///< u8 #lvhb_auth_flags, u8 count, count x (u8 key_id[8], u8 len, label).
+};
+
+/**
+ * @brief Authentication flags in HELLO_ACK and CONFIG.
+ */
+enum lvhb_auth_flags {
+  LVHB_AUTH_PAIRING_REQUIRED = 0x01,  ///< Layout and input frames need an authenticated session.
+  LVHB_AUTH_AUTHORIZED = 0x02,  ///< This session may send layout and input frames.
+};
+
+/**
+ * @brief Operations of #LVHB_MSG_CONFIG_SET.
+ */
+enum lvhb_config_op {
+  LVHB_CONFIG_REQUIRE_PAIRING = 1,  ///< u8 required (0 or 1).
+  LVHB_CONFIG_REVOKE = 2,  ///< u8 key_id[8].
+  LVHB_CONFIG_REVOKE_ALL = 3,  ///< No arguments.
 };
 
 /**
@@ -96,6 +136,11 @@ enum lvhb_status {
   LVHB_STATUS_INVALID_LAYOUT = 3,  ///< Layout exceeds the endpoint budget or is inconsistent.
   LVHB_STATUS_TOO_LARGE = 4,  ///< Descriptor, report, or string exceeds a protocol limit.
   LVHB_STATUS_VERSION_MISMATCH = 5,  ///< Host protocol version is not supported.
+  LVHB_STATUS_UNAUTHORIZED = 6,  ///< Pairing is required and this session is not authenticated, or AUTH failed.
+  LVHB_STATUS_BUSY = 7,  ///< Another request is waiting for the BOOT button.
+  LVHB_STATUS_FULL = 8,  ///< All pairing slots are in use.
+  LVHB_STATUS_TIMEOUT = 9,  ///< BOOT was not pressed in time.
+  LVHB_STATUS_NOT_FOUND = 10,  ///< No pairing has that key id.
 };
 
 /**

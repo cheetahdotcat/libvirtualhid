@@ -23,6 +23,15 @@
 #include <libvirtualhid/profiles.hpp>
 #include <libvirtualhid/report.hpp>
 
+#ifdef _WIN32
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <windows.h>
+#else
+  #include <unistd.h>
+#endif
+
 namespace lvh::detail::esp32 {
   namespace {
 
@@ -896,12 +905,42 @@ namespace lvh::detail::esp32 {
     return std::nullopt;
   }
 
+  std::string pairing_client_name(const std::string &application) {
+    std::string host;
+#ifdef _WIN32
+    char buffer[MAX_COMPUTERNAME_LENGTH + 1] {};
+    DWORD size = sizeof(buffer);
+    if (::GetComputerNameA(buffer, &size)) {
+      host.assign(buffer, size);
+    }
+#else
+    char buffer[256] {};
+    if (::gethostname(buffer, sizeof(buffer) - 1U) == 0) {
+      host = buffer;
+    }
+#endif
+    auto name = application.empty() ? std::string {"libvirtualhid"} : application;
+    if (!host.empty()) {
+      name += " on " + host;
+    }
+    if (name.size() > LVHB_MAX_PAIRING_NAME) {
+      name.resize(LVHB_MAX_PAIRING_NAME);
+    }
+    return name;
+  }
+
   std::unique_ptr<Backend> create_esp32_backend(std::shared_ptr<BridgeClient> client, std::unique_ptr<Backend> fallback) {
     return std::make_unique<Esp32Backend>(std::move(client), std::move(fallback));
   }
 
   std::unique_ptr<Backend> create_esp32_backend(const RuntimeOptions &options) {
-    auto client = std::make_shared<BridgeClient>(make_serial_port_opener(options.esp32_bridge_port), options.log_callback);
+    auto client = std::make_shared<BridgeClient>(
+      make_serial_port_opener(options.esp32_bridge_port),
+      options.log_callback,
+      BridgeTimings {},
+      make_file_credential_store(options.esp32_bridge_credential_dir),
+      pairing_client_name(options.esp32_bridge_client_name)
+    );
     return create_esp32_backend(std::move(client), create_platform_backend());
   }
 

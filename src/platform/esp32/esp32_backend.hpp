@@ -77,4 +77,12 @@ namespace lvh::detail::esp32 {
    */
   std::unique_ptr<Backend> create_esp32_backend(const RuntimeOptions &options);
 
+  /**
+   * @brief Build the label the bridge stores for this host's pairing.
+   *
+   * @param application Application name, `libvirtualhid` when empty.
+   * @return `<application> on <host name>`, at most #LVHB_MAX_PAIRING_NAME bytes.
+   */
+  std::string pairing_client_name(const std::string &application);
+
 }  // namespace lvh::detail::esp32

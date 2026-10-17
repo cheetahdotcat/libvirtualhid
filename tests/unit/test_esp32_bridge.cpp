@@ -9,7 +9,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -20,7 +23,9 @@
 
 // local includes
 #include "fixtures/fixtures.hpp"
+#include "platform/esp32/credential_store.hpp"
 #include "platform/esp32/esp32_backend.hpp"
+#include "platform/esp32/hmac_sha256.hpp"
 #include "platform/esp32/keyboard_mouse_reports.hpp"
 
 #include <libvirtualhid/profiles.hpp>
@@ -30,6 +35,8 @@ namespace {
 
   using namespace std::chrono_literals;
   using lvh::detail::esp32::BridgeClient;
+  using lvh::detail::esp32::BridgeCredential;
+  using lvh::detail::esp32::CredentialStore;
   using lvh::detail::esp32::BridgeTimings;
   using lvh::detail::esp32::SerialPort;
 
@@ -127,6 +134,48 @@ namespace {
       return active_;
     }
 
+    void require_pairing(bool required) {
+      std::lock_guard lock {mutex_};
+      require_pairing_ = required;
+    }
+
+    bool pairing_pending() {
+      std::lock_guard lock {mutex_};
+      return pending_pair_;
+    }
+
+    /**
+     * @brief Simulate a BOOT press: confirm the open pairing request.
+     */
+    void press_boot() {
+      std::lock_guard lock {mutex_};
+      if (!pending_pair_) {
+        return;
+      }
+      pending_pair_ = false;
+      BridgeCredential credential;
+      credential.key_id.fill(static_cast<std::uint8_t>(0x10U + pairings_.size()));
+      credential.secret.fill(static_cast<std::uint8_t>(0xA0U + pairings_.size()));
+      pairings_.push_back(credential);
+      authorized_ = true;
+      std::vector<std::uint8_t> result {LVHB_MSG_PAIR, LVHB_STATUS_OK};
+      result.insert(result.end(), credential.key_id.begin(), credential.key_id.end());
+      result.insert(result.end(), credential.secret.begin(), credential.secret.end());
+      send_locked(LVHB_MSG_CONFIRM_RESULT, result);
+    }
+
+    void revoke_all() {
+      std::lock_guard lock {mutex_};
+      pairings_.clear();
+    }
+
+    int auth_attempts() {
+      std::lock_guard lock {mutex_};
+      return auth_attempts_;
+    }
+
+    static constexpr std::array<std::uint8_t, LVHB_DEVICE_ID_SIZE> device_id {0xA4, 0xCB, 0x8F, 0x00, 0x00, 0x01};
+
     int commits() {
       std::lock_guard lock {mutex_};
       return commits_;
@@ -159,19 +208,52 @@ namespace {
         send_locked(LVHB_MSG_ACK, reply);
       };
 
+      if (!authorized_ && (type == LVHB_MSG_LAYOUT_BEGIN || type == LVHB_MSG_LAYOUT_SLOT || type == LVHB_MSG_LAYOUT_FEATURE || type == LVHB_MSG_LAYOUT_COMMIT)) {
+        ack(LVHB_STATUS_UNAUTHORIZED);
+        return;
+      }
+
       switch (type) {
         case LVHB_MSG_HELLO:
           {
+            authorized_ = !require_pairing_;
+            nonce_.fill(static_cast<std::uint8_t>(++nonce_counter_));
             std::vector<std::uint8_t> reply {LVHB_PROTOCOL_VERSION, 0, LVHB_MAX_SLOTS, 1};
             for (unsigned shift = 0; shift < 32U; shift += 8U) {
               reply.push_back(static_cast<std::uint8_t>(active_.generation >> shift));
             }
             reply.push_back(0x00);
             reply.push_back(0x02);
+            reply.push_back(static_cast<std::uint8_t>((require_pairing_ ? static_cast<unsigned>(LVHB_AUTH_PAIRING_REQUIRED) : 0U) | (authorized_ ? static_cast<unsigned>(LVHB_AUTH_AUTHORIZED) : 0U)));
+            reply.insert(reply.end(), nonce_.begin(), nonce_.end());
+            reply.insert(reply.end(), device_id.begin(), device_id.end());
             reply.insert(reply.end(), {'t', 'e', 's', 't'});
             send_locked(LVHB_MSG_HELLO_ACK, reply);
             break;
           }
+        case LVHB_MSG_AUTH:
+          {
+            ++auth_attempts_;
+            bool valid = false;
+            for (const auto &pairing : pairings_) {
+              if (payload.size() < LVHB_KEY_ID_SIZE + LVHB_MAC_SIZE || !std::equal(pairing.key_id.begin(), pairing.key_id.end(), payload.begin())) {
+                continue;
+              }
+              std::vector<std::uint8_t> message {LVHB_AUTH_CONTEXT, LVHB_AUTH_CONTEXT + sizeof(LVHB_AUTH_CONTEXT) - 1U};
+              message.insert(message.end(), nonce_.begin(), nonce_.end());
+              message.insert(message.end(), pairing.key_id.begin(), pairing.key_id.end());
+              message.insert(message.end(), device_id.begin(), device_id.end());
+              const auto mac = lvh::detail::esp32::hmac_sha256(pairing.secret, message);
+              valid = std::equal(mac.begin(), mac.end(), payload.begin() + LVHB_KEY_ID_SIZE);
+            }
+            authorized_ = authorized_ || valid;
+            ack(valid ? LVHB_STATUS_OK : LVHB_STATUS_UNAUTHORIZED);
+            break;
+          }
+        case LVHB_MSG_PAIR:
+          pending_pair_ = true;
+          ack(LVHB_STATUS_OK);
+          break;
         case LVHB_MSG_LAYOUT_BEGIN:
           staged_ = Layout {};
           staged_->vendor_id = static_cast<std::uint16_t>(payload[0] | (payload[1] << 8U));
@@ -208,6 +290,9 @@ namespace {
             break;
           }
         case LVHB_MSG_INPUT_REPORT:
+          if (!authorized_) {
+            break;
+          }
           inputs_.emplace_back(payload[0], std::vector<std::uint8_t> {payload.begin() + 1, payload.end()});
           break;
         case LVHB_MSG_PING:
@@ -247,6 +332,45 @@ namespace {
     std::uint8_t tx_sequence_ = 0;
     std::chrono::steady_clock::time_point present_after_ {};
     std::vector<std::pair<std::uint8_t, std::vector<std::uint8_t>>> inputs_;
+    bool require_pairing_ = false;
+    bool authorized_ = false;
+    bool pending_pair_ = false;
+    int auth_attempts_ = 0;
+    std::uint8_t nonce_counter_ = 0;
+    std::array<std::uint8_t, LVHB_NONCE_SIZE> nonce_ {};
+    std::vector<BridgeCredential> pairings_;
+  };
+
+  /**
+   * @brief Credential store kept in memory.
+   */
+  class MemoryCredentialStore final: public CredentialStore {
+  public:
+    std::optional<BridgeCredential> load(const std::string &device_id) override {
+      std::lock_guard lock {mutex_};
+      const auto found = credentials_.find(device_id);
+      return found != credentials_.end() ? std::optional {found->second} : std::nullopt;
+    }
+
+    bool save(const std::string &device_id, const BridgeCredential &credential) override {
+      std::lock_guard lock {mutex_};
+      credentials_[device_id] = credential;
+      return true;
+    }
+
+    void erase(const std::string &device_id) override {
+      std::lock_guard lock {mutex_};
+      credentials_.erase(device_id);
+    }
+
+    std::size_t size() {
+      std::lock_guard lock {mutex_};
+      return credentials_.size();
+    }
+
+  private:
+    std::mutex mutex_;
+    std::map<std::string, BridgeCredential> credentials_;
   };
 
   /**
@@ -288,6 +412,7 @@ namespace {
 
   struct BridgeHarness {
     std::shared_ptr<FakeBridgeDevice> device = std::make_shared<FakeBridgeDevice>();
+    std::shared_ptr<MemoryCredentialStore> credentials = std::make_shared<MemoryCredentialStore>();
     std::atomic_bool attached = true;
     std::shared_ptr<BridgeClient> client = std::make_shared<BridgeClient>(
       [this]() -> std::unique_ptr<SerialPort> {
@@ -296,8 +421,14 @@ namespace {
         }
         return std::make_unique<FakePort>(device, device->instance());
       },
-      nullptr,
-      fast_timings()
+      [](lvh::LogLevel, const std::string &message) {
+        if (std::getenv("LVH_TEST_LOG") != nullptr) {
+          std::fprintf(stderr, "[bridge] %s\n", message.c_str());
+        }
+      },
+      fast_timings(),
+      credentials,
+      "test host"
     );
     std::unique_ptr<lvh::detail::Backend> backend = lvh::detail::esp32::create_esp32_backend(client, nullptr);
 
@@ -609,6 +740,105 @@ TEST(Esp32BridgeBackendTest, RestoresLayoutAndLatestInputAfterBridgeReboot) {
     const auto inputs = harness.device->inputs();
     return inputs.size() >= 2U && inputs.back().second.size() == LVHB_XINPUT_REPORT_SIZE && inputs.back().second[3] == 0x20U;
   }));
+}
+
+TEST(Esp32BridgePairingTest, HmacSha256MatchesRfc4231) {
+  const std::string key = "Jefe";
+  const std::string message = "what do ya want for nothing?";
+  const auto mac = lvh::detail::esp32::hmac_sha256(
+    std::span<const std::uint8_t> {reinterpret_cast<const std::uint8_t *>(key.data()), key.size()},
+    std::span<const std::uint8_t> {reinterpret_cast<const std::uint8_t *>(message.data()), message.size()}
+  );
+  const std::array<std::uint8_t, 32> expected {
+    0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e, 0x6a, 0x04, 0x24, 0x26, 0x08, 0x95, 0x75, 0xc7,
+    0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83, 0x9d, 0xec, 0x58, 0xb9, 0x64, 0xec, 0x38, 0x43,
+  };
+  EXPECT_EQ(mac, expected);
+}
+
+TEST(Esp32BridgePairingTest, UnpairedBridgeDefersLayoutUntilBootPress) {
+  BridgeHarness harness;
+  harness.device->require_pairing(true);
+  auto created = harness.backend->create_gamepad(1, options_for(lvh::profiles::xbox_360()));
+  ASSERT_TRUE(created) << created.status.message();
+  EXPECT_TRUE(harness.client->awaiting_pairing());
+  ASSERT_TRUE(harness.device->wait_until([&]() {
+    return harness.device->pairing_pending();
+  }));
+  EXPECT_EQ(harness.device->commits(), 0);
+
+  harness.device->press_boot();
+  ASSERT_TRUE(harness.device->wait_until([&]() {
+    return harness.device->commits() == 1 && harness.device->active().slots[0].kind == LVHB_SLOT_XINPUT;
+  }));
+  EXPECT_FALSE(harness.client->awaiting_pairing());
+  EXPECT_EQ(harness.credentials->size(), 1U);
+  EXPECT_EQ(harness.client->device_id(), "A4CB8F000001");
+}
+
+TEST(Esp32BridgePairingTest, StoredPairingAuthenticatesAfterReboot) {
+  BridgeHarness harness;
+  harness.device->require_pairing(true);
+  auto created = harness.backend->create_gamepad(1, options_for(lvh::profiles::xbox_360()));
+  ASSERT_TRUE(created) << created.status.message();
+  ASSERT_TRUE(harness.device->wait_until([&]() {
+    return harness.device->pairing_pending();
+  }));
+  harness.device->press_boot();
+  ASSERT_TRUE(harness.device->wait_until([&]() {
+    return harness.device->commits() == 1;
+  }));
+
+  // Let the post-commit reconnect (the client reopens the port 100 ms after a commit) authenticate first.
+  std::this_thread::sleep_for(300ms);
+  ASSERT_TRUE(harness.device->wait_until([&]() {
+    return harness.device->auth_attempts() >= 1 && !harness.client->port_path().empty();
+  }));
+  const auto attempts = harness.device->auth_attempts();
+  harness.device->reboot();
+  ASSERT_TRUE(harness.device->wait_until([&]() {
+    return harness.device->commits() == 2 && harness.device->active().slots[0].kind == LVHB_SLOT_XINPUT;
+  }));
+  EXPECT_GT(harness.device->auth_attempts(), attempts);
+  EXPECT_FALSE(harness.device->pairing_pending());
+}
+
+TEST(Esp32BridgePairingTest, RevokedPairingAsksToPairAgain) {
+  BridgeHarness harness;
+  harness.device->require_pairing(true);
+  auto created = harness.backend->create_gamepad(1, options_for(lvh::profiles::xbox_360()));
+  ASSERT_TRUE(created) << created.status.message();
+  ASSERT_TRUE(harness.device->wait_until([&]() {
+    return harness.device->pairing_pending();
+  }));
+  harness.device->press_boot();
+  ASSERT_TRUE(harness.device->wait_until([&]() {
+    return harness.device->commits() == 1;
+  }));
+
+  harness.device->revoke_all();
+  harness.device->reboot();
+  ASSERT_TRUE(harness.device->wait_until([&]() {
+    return harness.device->pairing_pending();
+  }));
+  EXPECT_EQ(harness.credentials->size(), 0U);
+  EXPECT_TRUE(harness.client->awaiting_pairing());
+}
+
+TEST(Esp32BridgePairingTest, FileStoreRoundTripsCredential) {
+  const auto directory = std::filesystem::temp_directory_path() / ("lvh-bridge-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto store = lvh::detail::esp32::make_file_credential_store(directory.string());
+  BridgeCredential credential;
+  credential.key_id.fill(0x42);
+  credential.secret.fill(0x99);
+  ASSERT_TRUE(store->save("A4CB8F000001", credential));
+  const auto loaded = store->load("A4CB8F000001");
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(loaded->key_id, credential.key_id);
+  EXPECT_EQ(loaded->secret, credential.secret);
+  store->erase("A4CB8F000001");
+  EXPECT_FALSE(store->load("A4CB8F000001").has_value());
+  std::filesystem::remove_all(directory);
 }
 
 TEST(Esp32BridgeKeyboardMouseReportTest, DescriptorMatchesPackedReportSizes) {

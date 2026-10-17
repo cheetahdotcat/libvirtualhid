@@ -28,6 +28,7 @@
   // platform includes
   #include <fcntl.h>
   #include <poll.h>
+  #include <sys/ioctl.h>
   #include <termios.h>
   #include <unistd.h>
 #endif
@@ -241,6 +242,11 @@ namespace lvh::detail::esp32 {
 #else
     const int fd = ::open(path.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
+      return nullptr;
+    }
+    // Keep other unprivileged processes from opening the port while we own it (Windows COM ports are exclusive already).
+    if (::ioctl(fd, TIOCEXCL) != 0) {
+      ::close(fd);
       return nullptr;
     }
     termios options {};

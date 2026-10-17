@@ -9,6 +9,7 @@
 
 // local includes
 #include "platform/esp32/bridge_client.hpp"
+#include "platform/esp32/hmac_sha256.hpp"
 
 namespace lvh::detail::esp32 {
   namespace {
@@ -49,7 +50,9 @@ namespace lvh::detail::esp32 {
         case LVHB_STATUS_TOO_LARGE:
           return "descriptor or report exceeds the bridge limits";
         case LVHB_STATUS_VERSION_MISMATCH:
-          return "bridge firmware speaks a different protocol version";
+          return "bridge firmware speaks a different protocol version; flash the current firmware";
+        case LVHB_STATUS_UNAUTHORIZED:
+          return "bridge is not paired with this host";
         default:
           return "bridge returned status " + std::to_string(status);
       }
@@ -70,10 +73,12 @@ namespace lvh::detail::esp32 {
 
   }  // namespace
 
-  BridgeClient::BridgeClient(SerialPortOpener opener, BridgeLogger logger, BridgeTimings timings):
+  BridgeClient::BridgeClient(SerialPortOpener opener, BridgeLogger logger, BridgeTimings timings, std::shared_ptr<CredentialStore> credentials, std::string client_name):
       opener_ {std::move(opener)},
       logger_ {std::move(logger)},
       timings_ {timings},
+      credentials_ {std::move(credentials)},
+      client_name_ {std::move(client_name)},
       next_generation_ {initial_generation()} {}
 
   BridgeClient::~BridgeClient() {
@@ -99,7 +104,7 @@ namespace lvh::detail::esp32 {
 
     std::unique_lock lock {state_mutex_};
     if (!state_changed_.wait_for(lock, timings_.connect_timeout, [this]() {
-          return connected_;
+          return connected_ || awaiting_pairing_;
         })) {
       return OperationStatus::failure(
         ErrorCode::backend_unavailable,
@@ -115,13 +120,15 @@ namespace lvh::detail::esp32 {
   }
 
   OperationStatus BridgeClient::apply_layout_locked(const BridgeLayout &layout) {
+    bool deferred;
     {
       std::unique_lock lock {state_mutex_};
       if (!state_changed_.wait_for(lock, timings_.connect_timeout, [this]() {
-            return connected_;
+            return connected_ || awaiting_pairing_;
           })) {
         return OperationStatus::failure(ErrorCode::backend_unavailable, "ESP32-S3 bridge is not connected");
       }
+      deferred = !connected_;
     }
 
     std::uint8_t kinds[LVHB_MAX_SLOTS] {};
@@ -130,6 +137,15 @@ namespace lvh::detail::esp32 {
     }
     if (lvhb_layout_fits(kinds) == 0) {
       return OperationStatus::failure(ErrorCode::unsupported_profile, status_message(LVHB_STATUS_INVALID_LAYOUT));
+    }
+
+    if (deferred) {
+      // The supervisor applies the desired layout once pairing completes.
+      track_layout_inputs(layout);
+      desired_layout_ = layout;
+      desired_generation_ = take_generation();
+      log(LogLevel::info, "ESP32-S3 bridge layout will be applied once the bridge is paired");
+      return OperationStatus::success();
     }
 
     std::vector<std::uint8_t> payload;
@@ -174,19 +190,8 @@ namespace lvh::detail::esp32 {
       }
     }
 
-    const auto generation = next_generation_++;
-    if (next_generation_ == 0U) {
-      next_generation_ = 1U;
-    }
-    {
-      std::lock_guard lock {input_mutex_};
-      for (std::size_t index = 0; index < LVHB_MAX_SLOTS; ++index) {
-        if (!desired_layout_.has_value() || !same_slot(desired_layout_->slots[index], layout.slots[index])) {
-          latest_inputs_[index].clear();
-        }
-        replayable_[index] = layout.slots[index].has_value() && layout.slots[index]->kind != LVHB_SLOT_KEYBOARD_MOUSE;
-      }
-    }
+    const auto generation = take_generation();
+    track_layout_inputs(layout);
     auto previous_layout = std::exchange(desired_layout_, layout);
     const auto previous_generation = std::exchange(desired_generation_, generation);
 
@@ -211,6 +216,24 @@ namespace lvh::detail::esp32 {
     }
     replay_inputs();
     return OperationStatus::success();
+  }
+
+  std::uint32_t BridgeClient::take_generation() {
+    const auto generation = next_generation_++;
+    if (next_generation_ == 0U) {
+      next_generation_ = 1U;
+    }
+    return generation;
+  }
+
+  void BridgeClient::track_layout_inputs(const BridgeLayout &layout) {
+    std::lock_guard lock {input_mutex_};
+    for (std::size_t index = 0; index < LVHB_MAX_SLOTS; ++index) {
+      if (!desired_layout_.has_value() || !same_slot(desired_layout_->slots[index], layout.slots[index])) {
+        latest_inputs_[index].clear();
+      }
+      replayable_[index] = layout.slots[index].has_value() && layout.slots[index]->kind != LVHB_SLOT_KEYBOARD_MOUSE;
+    }
   }
 
   void BridgeClient::send_input(std::uint8_t slot, std::span<const std::uint8_t> report) {
@@ -238,6 +261,16 @@ namespace lvh::detail::esp32 {
   std::string BridgeClient::firmware_version() const {
     std::lock_guard lock {state_mutex_};
     return firmware_version_;
+  }
+
+  std::string BridgeClient::device_id() const {
+    std::lock_guard lock {state_mutex_};
+    return device_id_;
+  }
+
+  bool BridgeClient::awaiting_pairing() const {
+    std::lock_guard lock {state_mutex_};
+    return awaiting_pairing_;
   }
 
   std::string BridgeClient::port_path() const {
@@ -308,6 +341,7 @@ namespace lvh::detail::esp32 {
       next_keepalive = now + timings_.keepalive_interval;
 
       bool connected;
+      bool retry_pairing;
       std::uint32_t device_generation;
       std::chrono::steady_clock::time_point last_frame;
       {
@@ -315,6 +349,13 @@ namespace lvh::detail::esp32 {
         connected = connected_;
         device_generation = device_generation_;
         last_frame = last_frame_time_;
+        retry_pairing = awaiting_pairing_ && pairing_retry_at_.has_value() && now >= *pairing_retry_at_;
+        if (retry_pairing) {
+          pairing_retry_at_.reset();
+        }
+      }
+      if (retry_pairing) {
+        request_pairing();
       }
       if (!connected) {
         continue;
@@ -371,6 +412,8 @@ namespace lvh::detail::esp32 {
     }
     std::lock_guard lock {state_mutex_};
     connected_ = false;
+    awaiting_pairing_ = false;
+    pairing_retry_at_.reset();
     state_changed_.notify_all();
   }
 
@@ -408,20 +451,61 @@ namespace lvh::detail::esp32 {
     const auto sequence = frame[1];
     const auto payload = frame.subspan(2);
     bool replay = false;
+    bool authenticate_now = false;
+    bool pair_now = false;
     {
       std::lock_guard lock {state_mutex_};
       last_frame_time_ = std::chrono::steady_clock::now();
       switch (type) {
         case LVHB_MSG_HELLO_ACK:
-          if (payload.size() >= 10U) {
-            connected_ = true;
+          {
+            constexpr std::size_t flags_offset = 10U;
+            constexpr std::size_t nonce_offset = flags_offset + 1U;
+            constexpr std::size_t device_offset = nonce_offset + LVHB_NONCE_SIZE;
+            constexpr std::size_t firmware_offset = device_offset + LVHB_DEVICE_ID_SIZE;
+            if (payload.size() < firmware_offset) {
+              break;
+            }
             device_generation_ = read_u32(payload.subspan(4));
-            firmware_version_.assign(payload.begin() + 10, payload.end());
-            replay = device_generation_ != 0U && device_generation_ == desired_generation_;
-            state_changed_.notify_all();
+            firmware_version_.assign(payload.begin() + firmware_offset, payload.end());
+            std::copy_n(payload.begin() + nonce_offset, LVHB_NONCE_SIZE, nonce_.begin());
+            std::copy_n(payload.begin() + device_offset, LVHB_DEVICE_ID_SIZE, device_id_bytes_.begin());
+            static constexpr char digits[] = "0123456789ABCDEF";
+            device_id_.clear();
+            for (const auto byte : device_id_bytes_) {
+              device_id_.push_back(digits[byte >> 4U]);
+              device_id_.push_back(digits[byte & 0x0FU]);
+            }
+            if ((payload[flags_offset] & LVHB_AUTH_AUTHORIZED) != 0U) {
+              connected_ = true;
+              replay = device_generation_ != 0U && device_generation_ == desired_generation_;
+              state_changed_.notify_all();
+            } else {
+              authenticate_now = true;
+            }
+            break;
           }
-          break;
         case LVHB_MSG_ACK:
+          if (payload.size() >= 3U && payload[0] == LVHB_MSG_AUTH) {
+            if (payload[2] == LVHB_STATUS_OK) {
+              log(LogLevel::debug, "authenticated with ESP32-S3 bridge " + device_id_);
+              connected_ = true;
+              awaiting_pairing_ = false;
+              replay = device_generation_ != 0U && device_generation_ == desired_generation_;
+              state_changed_.notify_all();
+            } else {
+              pair_now = true;
+            }
+            break;
+          }
+          if (payload.size() >= 3U && payload[0] == LVHB_MSG_PAIR) {
+            if (payload[2] == LVHB_STATUS_BUSY) {
+              pairing_retry_at_ = last_frame_time_ + std::chrono::seconds {1};
+            } else if (payload[2] == LVHB_STATUS_FULL) {
+              pairing_retry_at_ = last_frame_time_ + std::chrono::milliseconds {LVHB_CONFIRM_WINDOW_MS};
+              log(LogLevel::error, "ESP32-S3 bridge already has " + std::to_string(LVHB_MAX_PAIRINGS) + " paired hosts; remove one on the flasher site's configure page, or hold BOOT for 10 s to remove all");
+            }
+          }
           if (payload.size() >= 3U) {
             if (payload[0] == LVHB_MSG_HELLO && payload[2] == LVHB_STATUS_VERSION_MISMATCH) {
               firmware_version_ = "incompatible";
@@ -439,11 +523,44 @@ namespace lvh::detail::esp32 {
             state_changed_.notify_all();
           }
           break;
+        case LVHB_MSG_CONFIRM_RESULT:
+          if (payload.size() >= 2U && payload[0] == LVHB_MSG_PAIR && awaiting_pairing_) {
+            if (payload[1] == LVHB_STATUS_OK && payload.size() >= 2U + LVHB_KEY_ID_SIZE + LVHB_SECRET_SIZE) {
+              BridgeCredential credential;
+              std::copy_n(payload.begin() + 2, LVHB_KEY_ID_SIZE, credential.key_id.begin());
+              std::copy_n(payload.begin() + 2 + LVHB_KEY_ID_SIZE, LVHB_SECRET_SIZE, credential.secret.begin());
+              if (credentials_ == nullptr || !credentials_->save(device_id_, credential)) {
+                log(LogLevel::error, "paired with ESP32-S3 bridge " + device_id_ + " but could not store the pairing; it will ask again next time");
+              } else {
+                log(LogLevel::info, "paired with ESP32-S3 bridge " + device_id_);
+              }
+              // The bridge authorizes the session that completed pairing.
+              connected_ = true;
+              awaiting_pairing_ = false;
+              pairing_announced_ = false;
+              replay = device_generation_ != 0U && device_generation_ == desired_generation_;
+              state_changed_.notify_all();
+            } else {
+              // Keep a request open while unpaired so a later BOOT press still pairs.
+              pairing_retry_at_ = last_frame_time_ + (payload[1] == LVHB_STATUS_TIMEOUT ? std::chrono::milliseconds {0} : std::chrono::milliseconds {LVHB_CONFIRM_WINDOW_MS});
+            }
+          }
+          break;
         default:
           break;
       }
     }
     static_cast<void>(sequence);
+
+    if (authenticate_now) {
+      authenticate();
+    } else if (pair_now) {
+      log(LogLevel::warning, "ESP32-S3 bridge rejected the stored pairing (it was removed on the bridge); pairing again");
+      if (credentials_ != nullptr) {
+        credentials_->erase(device_id());
+      }
+      request_pairing();
+    }
 
     if (type == LVHB_MSG_ACK && payload.size() >= 3U && payload[0] == LVHB_MSG_HELLO && payload[2] == LVHB_STATUS_VERSION_MISMATCH) {
       log(LogLevel::error, status_message(LVHB_STATUS_VERSION_MISMATCH));
@@ -505,6 +622,57 @@ namespace lvh::detail::esp32 {
     return state_changed_.wait_for(lock, timeout, [this, generation]() {
       return connected_ && device_generation_ == generation;
     });
+  }
+
+  void BridgeClient::authenticate() {
+    std::string device_id;
+    std::array<std::uint8_t, LVHB_NONCE_SIZE> nonce;
+    std::array<std::uint8_t, LVHB_DEVICE_ID_SIZE> device_bytes;
+    {
+      std::lock_guard lock {state_mutex_};
+      device_id = device_id_;
+      nonce = nonce_;
+      device_bytes = device_id_bytes_;
+    }
+    const auto credential = credentials_ != nullptr ? credentials_->load(device_id) : std::nullopt;
+    if (!credential.has_value()) {
+      request_pairing();
+      return;
+    }
+
+    std::vector<std::uint8_t> message {LVHB_AUTH_CONTEXT, LVHB_AUTH_CONTEXT + sizeof(LVHB_AUTH_CONTEXT) - 1U};
+    message.insert(message.end(), nonce.begin(), nonce.end());
+    message.insert(message.end(), credential->key_id.begin(), credential->key_id.end());
+    message.insert(message.end(), device_bytes.begin(), device_bytes.end());
+    const auto mac = hmac_sha256(credential->secret, message);
+
+    std::vector<std::uint8_t> payload {credential->key_id.begin(), credential->key_id.end()};
+    payload.insert(payload.end(), mac.begin(), mac.end());
+    static_cast<void>(write_frame(LVHB_MSG_AUTH, payload));
+  }
+
+  void BridgeClient::request_pairing() {
+    bool announce;
+    std::string device_id;
+    {
+      std::lock_guard lock {state_mutex_};
+      awaiting_pairing_ = true;
+      announce = !pairing_announced_;
+      pairing_announced_ = true;
+      device_id = device_id_;
+      state_changed_.notify_all();
+    }
+    if (announce) {
+      log(
+        LogLevel::warning,
+        "ESP32-S3 bridge " + device_id + " is not paired with this host. Press the BOOT button on the bridge to allow " + client_name_ + " to use it."
+      );
+    }
+    std::vector<std::uint8_t> payload;
+    const auto size = std::min<std::size_t>(client_name_.size(), LVHB_MAX_PAIRING_NAME);
+    payload.push_back(static_cast<std::uint8_t>(size));
+    payload.insert(payload.end(), client_name_.begin(), client_name_.begin() + static_cast<std::ptrdiff_t>(size));
+    static_cast<void>(write_frame(LVHB_MSG_PAIR, payload));
   }
 
   void BridgeClient::replay_inputs() {

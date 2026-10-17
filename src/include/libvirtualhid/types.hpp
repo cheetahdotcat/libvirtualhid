@@ -156,6 +156,22 @@ namespace lvh {
      * `false` so other choices are never redirected to the bridge.
      */
     bool esp32_bridge_autodetect = true;
+
+    /**
+     * @brief Directory holding ESP32-S3 bridge pairing secrets.
+     *
+     * When empty, `%ProgramData%\\libvirtualhid\\esp32-bridge` on Windows and
+     * `$XDG_CONFIG_HOME/libvirtualhid/esp32-bridge` elsewhere. Files are
+     * created readable only by their owner (and SYSTEM/Administrators on Windows).
+     */
+    std::string esp32_bridge_credential_dir;
+
+    /**
+     * @brief Application name shown for this host's pairing on the ESP32-S3 bridge.
+     *
+     * The host name is appended, for example `Sunshine on DESKTOP-1`.
+     */
+    std::string esp32_bridge_client_name = "libvirtualhid";
   };
 
   /**
